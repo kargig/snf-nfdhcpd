@@ -7,13 +7,17 @@ Standards-Version: 3.9.1
 
 Package: nfdhcpd
 Architecture: all
-Depends: ${misc:Depends}, ${python:Depends}, python-scapy(>= 2.0.1-1),
+Depends: ${misc:Depends}, ${python:Depends},
          python-daemon(>=1.5.2-1), python-pyinotify(>=0.7.1-1),
-         python-ipy(>=1:0.62-1), python-nfqueue(> 0.4-3),
+         python-ipy(>=1:0.62-1), python-setproctitle,
          python-cap-ng(>=0.6.0-1), python(>=2.4), python-configobj(>= 4.5.2-1),
-         python-setproctitle
+         python-scapy(> 2.2.0-1), python-nfqueue(> 0.4-3)
 Suggests: ferm
-Description: A small DHCP/NDP proxy for virtual machines
- nfdhcpd is a small DHCP/NDP/RA proxy for virtual machines. Its intended use is
- to provide network configuration for routed (not bridged) VM instances. It
- supports DHCP, IPv6 NDP proxy and ICMPv6 RA RDNSS (RFC 5006).
+Description: A small DHCP/DHCPv6/NDP/RA proxy for virtual machines
+ nfdhcpd is a small DHCP/DHCPDv6/NDP/RA proxy for virtual machines based
+ on nfqueue. Its intended use is to provide network configuration for
+ VM instances inside a Ganeti cluster. Its binding files (DB leases) will
+ be updated by the snf-network package.
+ It supports DHCP for routed and bridged instances. IPv6 SLAAC is only
+ supported for routed instances in a sence is an NDP proxy while it provides
+ DNS info via RDNSS option of IPv6 RA (RFC 5006) or via stateless DHCPv6.
