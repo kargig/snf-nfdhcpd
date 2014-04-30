@@ -2,3 +2,5 @@
 *.swp
 *~
 .dir
+version.py
+docs/_build

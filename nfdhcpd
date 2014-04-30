@@ -2,7 +2,7 @@
 #
 
 # nfdcpd: A promiscuous, NFQUEUE-based DHCP server for virtual machine hosting
-# Copyright (c) 2010 GRNET SA
+# Copyright (c) 2010, 2011, 2012, 2013, 2014 GRNET SA
 #
 #    This program is free software; you can redistribute it and/or modify
 #    it under the terms of the GNU General Public License as published by
@@ -30,7 +30,6 @@ import logging
 import logging.handlers
 import threading
 import traceback
-import subprocess
 
 import daemon
 import daemon.runner
@@ -54,6 +53,9 @@ from scapy.layers.inet6 import IPv6, ICMPv6ND_RA, ICMPv6ND_NA, \
                                ICMPv6NDOptPrefixInfo, \
                                ICMPv6NDOptRDNSS
 from scapy.layers.dhcp import BOOTP, DHCP
+from scapy.layers.dhcp6 import DHCP6_Reply, DHCP6OptDNSServers, \
+                               DHCP6OptServerId, DHCP6OptClientId, \
+                               DUID_LLT, DHCP6_InfoRequest, DHCP6OptDNSDomains
 
 
 DEFAULT_CONFIG = "/etc/nfdhcpd/nfdhcpd.conf"
@@ -92,7 +94,9 @@ enable_ipv6 = boolean(default=True)
 ra_period = integer(min=1, max=4294967295)
 rs_queue = integer(min=0, max=65535)
 ns_queue = integer(min=0, max=65535)
+dhcp_queue = integer(min=0, max=65535)
 nameservers = ip_addr_list(family=6)
+domains = force_list(default=None)
 """
 
 
@@ -139,21 +143,6 @@ def get_indev(payload):
     logging.debug(" - Incoming packet from tap with ifindex %s", indev_ifindex)
 
     return indev_ifindex
-
-
-def get_binding(proxy, ifindex, mac):
-    try:
-        if proxy.mac_indexed_clients:
-            logging.debug(" - Getting binding for mac %s", mac)
-            b = proxy.clients[mac]
-        else:
-            logging.debug(" - Getting binding for ifindex %s", ifindex)
-            b = proxy.clients[ifindex]
-        return b
-    except KeyError:
-        logging.debug(" - No client found for mac / ifindex %s / %s",
-                      mac, ifindex)
-        return None
 
 
 def parse_binding_file(path):
@@ -237,8 +226,10 @@ class ClientFileHandler(pyinotify.ProcessEvent):
 
 
 class Client(object):
-    def __init__(self, tap=None, indev=None, mac=None, ip=None, hostname=None,
-                 subnet=None, gateway=None, subnet6=None, gateway6=None, eui64=None ):
+    def __init__(self, tap=None, indev=None,
+                 mac=None, ip=None, hostname=None,
+                 subnet=None, gateway=None,
+                 subnet6=None, gateway6=None, eui64=None):
         self.mac = mac
         self.ip = ip
         self.hostname = hostname
@@ -254,8 +245,7 @@ class Client(object):
         self.open_socket()
 
     def is_valid(self):
-        return self.mac is not None and self.ip is not None\
-               and self.hostname is not None
+        return self.mac is not None and self.hostname is not None
 
 
     def open_socket(self):
@@ -290,6 +280,15 @@ class Client(object):
         if count != ldata:
             logging.warn(" - Truncated msg: %d/%d bytes sent",
                          count, ldata)
+
+    def __repr__(self):
+        ret =  "hostname %s, tap %s, mac %s" % \
+               (self.hostname, self.tap, self.mac)
+        if self.ip:
+            ret += ", ip %s" % self.ip
+        if self.eui64:
+            ret += ", eui64 %s" % self.eui64
+        return ret
 
 
 class Subnet(object):
@@ -364,12 +363,13 @@ class Subnet(object):
 
 class VMNetProxy(object):  # pylint: disable=R0902
     def __init__(self, data_path, dhcp_queue_num=None,  # pylint: disable=R0913
-                 rs_queue_num=None, ns_queue_num=None,
+                 rs_queue_num=None, ns_queue_num=None, dhcpv6_queue_num=None,
                  dhcp_lease_lifetime=DEFAULT_LEASE_LIFETIME,
                  dhcp_lease_renewal=DEFAULT_LEASE_RENEWAL,
-                 dhcp_domain='',
+                 dhcp_domain=None,
                  dhcp_server_ip=DHCP_DUMMY_SERVER_IP, dhcp_nameservers=None,
-                 ra_period=DEFAULT_RA_PERIOD, ipv6_nameservers=None):
+                 ra_period=DEFAULT_RA_PERIOD, ipv6_nameservers=None,
+                 dhcpv6_domains=None):
 
         try:
             getattr(nfqueue.payload, 'get_physindev')
@@ -391,6 +391,11 @@ class VMNetProxy(object):  # pylint: disable=R0902
             self.ipv6_nameservers = []
         else:
             self.ipv6_nameservers = ipv6_nameservers
+
+        if dhcpv6_domains is None:
+            self.dhcpv6_domains = []
+        else:
+            self.dhcpv6_domains = dhcpv6_domains
 
         self.ipv6_enabled = False
 
@@ -420,6 +425,24 @@ class VMNetProxy(object):  # pylint: disable=R0902
             self._setup_nfqueue(ns_queue_num, AF_INET6, self.ns_response, 10)
             self.ipv6_enabled = True
 
+        if dhcpv6_queue_num is not None:
+            self._setup_nfqueue(dhcpv6_queue_num, AF_INET6, self.dhcpv6_response, 10)
+            self.ipv6_enabled = True
+
+    def get_binding(self, ifindex, mac):
+        try:
+            if self.mac_indexed_clients:
+                logging.debug(" - Getting binding for mac %s", mac)
+                b = self.clients[mac]
+            else:
+                logging.debug(" - Getting binding for ifindex %s", ifindex)
+                b = self.clients[ifindex]
+            logging.info(" - Client found. %s", b)
+            return b
+        except KeyError:
+            logging.info(" - No client found. mac: %s, ifindex: %s",
+                         mac, ifindex)
+            return None
 
     def _cleanup(self):
         """ Free all resources for a graceful exit
@@ -428,7 +451,7 @@ class VMNetProxy(object):  # pylint: disable=R0902
         logging.info("Cleaning up")
 
         logging.debug(" - Closing netfilter queues")
-        for q, num in self.nfq.values():
+        for q, _ in self.nfq.values():
             q.close()
 
         logging.debug(" - Stopping inotify watches")
@@ -447,15 +470,6 @@ class VMNetProxy(object):  # pylint: disable=R0902
         q.set_mode(nfqueue.NFQNL_COPY_PACKET)
         self.nfq[q.get_fd()] = (q, pending)
         logging.debug(" - Successfully set up NFQUEUE %d", queue_num)
-
-    def sendp(self, data, binding):
-        """ Send a raw packet using a layer-2 socket
-
-        """
-        logging.info(" - Sending raw packet on %s (%s)",
-                     binding.tap, binding.hostname)
-        binding.sendp(data)
-
 
     def build_config(self):
         self.clients.clear()
@@ -546,11 +560,11 @@ class VMNetProxy(object):  # pylint: disable=R0902
             if b.is_valid():
                 if self.mac_indexed_clients:
                     self.clients[b.mac] = b
+                    k = b.mac
                 else:
                     self.clients[ifindex] = b
-                logging.debug(" - Added client:")
-                logging.debug(" + %5s: %10s %20s %7s %15s",
-                               ifindex, b.hostname, b.mac, b.tap, b.ip)
+                    k = ifindex
+                logging.info(" - Added client %s. %s", k, b)
 
     def remove_tap(self, tap):
         """ Cleanup clients on a removed interface
@@ -559,21 +573,26 @@ class VMNetProxy(object):  # pylint: disable=R0902
         try:
             for k, cl in self.clients.items():
                 if cl.tap == tap:
-                    logging.info("Removing client %s and closing socket on %s",
-                                 cl.hostname, cl.tap)
-                    logging.debug(" - %10s | %10s %20s %10s %20s",
-                                  k, cl.hostname, cl.mac, cl.tap, cl.ip)
                     cl.socket.close()
                     del self.clients[k]
+                    logging.info("Removed client %s. %s", k, cl)
         except:
             logging.debug("Client on %s disappeared!!!", tap)
 
 
-    def dhcp_response(self, dummy, payload):  # pylint: disable=W0613,R0914
+    def dhcp_response(self, arg1, arg2=None):  # pylint: disable=W0613,R0914
         """ Generate a reply to bnetfilter-queue-deva BOOTP/DHCP request
 
         """
-        logging.info(" * Processing pending DHCP request")
+        logging.info(" * DHCP: Processing pending request")
+        # Workaround for supporting both squeezy's nfqueue-bindings-python
+        # and wheezy's python-nfqueue because for some reason the function's
+        # signature has changed and has broken compatibility
+        # See bug http://bugs.debian.org/cgi-bin/bugreport.cgi?bug=718894
+        if arg2:
+            payload = arg2
+        else:
+            payload = arg1
         # Decode the response - NFQUEUE relays IP packets
         pkt = IP(payload.get_data())
         #logging.debug(pkt.show())
@@ -590,13 +609,10 @@ class VMNetProxy(object):  # pylint: disable=R0902
 
         indev = get_indev(payload)
 
-        binding = get_binding(self, indev, mac)
+        binding = self.get_binding(indev, mac)
         if binding is None:
             # We don't know anything about this interface, so accept the packet
-            # and return
-            logging.debug(" - Ignoring DHCP request on unknown iface %s", indev)
-            # We don't know what to do with this packet, so let the kernel
-            # handle it
+            # and return an let the kernel handle it
             payload.set_verdict(nfqueue.NF_ACCEPT)
             return
 
@@ -604,22 +620,22 @@ class VMNetProxy(object):  # pylint: disable=R0902
         payload.set_verdict(nfqueue.NF_DROP)
 
         if mac != binding.mac:
-            logging.warn(" - Recieved spoofed DHCP request for mac %s from tap %s", mac, indev)
+            logging.warn(" - DHCP: Recieved spoofed request from %s (and not %s)",
+                         mac, binding)
             return
 
-        logging.info(" - Generating DHCP response for host %s (mac %s) on tap %s",
-                       binding.hostname, mac, binding.tap)
+        if not binding.ip:
+            logging.info(" - DHCP: No IP found in binding file %s.", binding)
+            return
 
+        if not DHCP in pkt:
+            logging.warn(" - DHCP: Invalid request with no DHCP payload found. %s", binding)
+            return
 
         resp = Ether(dst=mac, src=self.get_iface_hw_addr(binding.indev))/\
                IP(src=DHCP_DUMMY_SERVER_IP, dst=binding.ip)/\
                UDP(sport=pkt.dport, dport=pkt.sport)/resp
         subnet = binding.net
-
-        if not DHCP in pkt:
-            logging.warn(" - Invalid request from %s on %s, no DHCP"
-                         " payload found", binding.mac, binding.tap)
-            return
 
         dhcp_options = []
         requested_addr = binding.ip
@@ -629,8 +645,8 @@ class VMNetProxy(object):  # pylint: disable=R0902
             if type(opt) is tuple and opt[0] == "requested_addr":
                 requested_addr = opt[1]
 
-        logging.info(" - %s from %s on %s", DHCP_TYPES.get(req_type, "UNKNOWN"),
-                     binding.mac, binding.tap)
+        logging.info(" - DHCP: %s from %s",
+                     DHCP_TYPES.get(req_type, "UNKNOWN"), binding)
 
         if self.dhcp_domain:
             domainname = self.dhcp_domain
@@ -639,9 +655,8 @@ class VMNetProxy(object):  # pylint: disable=R0902
 
         if req_type == DHCPREQUEST and requested_addr != binding.ip:
             resp_type = DHCPNAK
-            logging.info(" - Sending DHCPNAK to %s on %s: requested %s"
-                         " instead of %s", binding.mac, binding.tap,
-                         requested_addr, binding.ip)
+            logging.info(" - DHCP: Sending DHCPNAK to %s (because requested %s)",
+                         binding, requested_addr)
 
         elif req_type in (DHCPDISCOVER, DHCPREQUEST):
             resp_type = DHCP_REQRESP[req_type]
@@ -668,7 +683,7 @@ class VMNetProxy(object):  # pylint: disable=R0902
 
         elif req_type == DHCPRELEASE:
             # Log and ignore
-            logging.info(" - DHCPRELEASE from %s on %s", binding.mac, binding.tap)
+            logging.info(" - DHCP: DHCPRELEASE from %s", binding)
             return
 
         # Finally, always add the server identifier and end options
@@ -679,54 +694,45 @@ class VMNetProxy(object):  # pylint: disable=R0902
         ]
         resp /= DHCP(options=dhcp_options)
 
-        logging.info(" - %s to %s (%s) on %s", DHCP_TYPES[resp_type], mac,
-                     binding.ip, binding.tap)
+        logging.info(" - RESPONSE: %s for %s", DHCP_TYPES[resp_type], binding)
         try:
-            self.sendp(resp, binding)
+            binding.sendp(resp)
         except socket.error, e:
-            logging.warn(" - DHCP response on %s (%s) failed: %s",
-                         binding.tap, binding.hostname, str(e))
+            logging.warn(" - DHCP: Response on %s failed: %s", binding, str(e))
         except Exception, e:
-            logging.warn(" - Unkown error during DHCP response on %s (%s): %s",
-                         binding.tap, binding.hostname, str(e))
+            logging.warn(" - DHCP: Unkown error during response on %s: %s",
+                         binding, str(e))
 
-    def rs_response(self, dummy, payload):  # pylint: disable=W0613
-        """ Generate a reply to a BOOTP/DHCP request
+    def dhcpv6_response(self, arg1, arg2=None):  # pylint: disable=W0613
 
-        """
-        logging.info(" * Processing pending RS request")
+        logging.info(" * DHCPv6: Processing pending request")
+        # Workaround for supporting both squeezy's nfqueue-bindings-python
+        # and wheezy's python-nfqueue because for some reason the function's
+        # signature has changed and has broken compatibility
+        # See bug http://bugs.debian.org/cgi-bin/bugreport.cgi?bug=718894
+        if arg2:
+            payload = arg2
+        else:
+            payload = arg1
         pkt = IPv6(payload.get_data())
-        #logging.debug(pkt.show())
-        try:
-            mac = pkt.lladdr
-        except:
-            logging.debug(" - Cannot obtain lladdr in rs")
-            return
-
         indev = get_indev(payload)
 
-        binding = get_binding(self, indev, mac)
+        #TODO: figure out how to find the src mac
+        mac = None
+        binding = self.get_binding(indev, mac)
         if binding is None:
             # We don't know anything about this interface, so accept the packet
-            # and return
-            logging.debug(" - Ignoring router solicitation on for mac %s", mac)
-            # We don't know what to do with this packet, so let the kernel
-            # handle it
+            # and return and let the kernel handle it
             payload.set_verdict(nfqueue.NF_ACCEPT)
             return
 
         # Signal the kernel that it shouldn't further process the packet
         payload.set_verdict(nfqueue.NF_DROP)
 
-        if mac != binding.mac:
-            logging.warn(" - Received spoofed RS request for mac %s from tap %s",
-                         mac, binding.tap)
-            return
-
         subnet = binding.net6
 
         if subnet.net is None:
-            logging.debug(" - No IPv6 network assigned for tap %s", binding.tap)
+            logging.debug(" - DHCPv6: No IPv6 network assigned to %s", binding)
             return
 
         indevmac = self.get_iface_hw_addr(binding.indev)
@@ -734,11 +740,91 @@ class VMNetProxy(object):  # pylint: disable=R0902
         if ifll is None:
             return
 
-        logging.info(" - Generating RA for host %s (mac %s) on tap %s",
-                      binding.hostname, mac, binding.tap)
+        ofll = subnet.make_ll64(binding.mac)
+        if ofll is None:
+            return
+
+        if self.dhcpv6_domains:
+            domains = self.dhcpv6_domains
+        else:
+            domains = [binding.hostname.split('.', 1)[-1]]
+
+        # We do this in order not to caclulate optlen ourselves
+        dnsdomains = str(DHCP6OptDNSDomains(dnsdomains=domains))
+        dnsservers = str(DHCP6OptDNSServers(dnsservers=self.ipv6_nameservers))
+
+        resp = Ether(src=indevmac, dst=binding.mac)/\
+               IPv6(tc=192, src=str(ifll), dst=str(ofll))/\
+               UDP(sport=pkt.dport, dport=pkt.sport)/\
+               DHCP6_Reply(trid=pkt[DHCP6_InfoRequest].trid)/\
+               DHCP6OptClientId(duid=pkt[DHCP6OptClientId].duid)/\
+               DHCP6OptServerId(duid=DUID_LLT(lladdr=indevmac, timeval=time.time()))/\
+               DHCP6OptDNSDomains(dnsdomains)/\
+               DHCP6OptDNSServers(dnsservers)
+
+        logging.info(" - RESPONSE: DHCPv6 reply for %s", binding)
+
+        try:
+            binding.sendp(resp)
+        except socket.error, e:
+            logging.warn(" - DHCPv6: Response on %s failed: %s",
+                         binding, str(e))
+        except Exception, e:
+            logging.warn(" - DHCPv6: Unkown error during response on %s: %s",
+                         binding, str(e))
+
+
+    def rs_response(self, arg1, arg2=None):  # pylint: disable=W0613
+        """ Generate a reply to an ICMPv6 router solicitation
+
+        """
+        logging.info(" * RS: Processing pending request")
+        # Workaround for supporting both squeezy's nfqueue-bindings-python
+        # and wheezy's python-nfqueue because for some reason the function's
+        # signature has changed and has broken compatibility
+        # See bug http://bugs.debian.org/cgi-bin/bugreport.cgi?bug=718894
+        if arg2:
+            payload = arg2
+        else:
+            payload = arg1
+        pkt = IPv6(payload.get_data())
+        #logging.debug(pkt.show())
+        try:
+            mac = pkt.lladdr
+        except:
+            logging.debug(" - RS: Cannot obtain lladdr")
+            return
+
+        indev = get_indev(payload)
+
+        binding = self.get_binding(indev, mac)
+        if binding is None:
+            # We don't know anything about this interface, so accept the packet
+            # and return and let the kernel handle it
+            payload.set_verdict(nfqueue.NF_ACCEPT)
+            return
+
+        # Signal the kernel that it shouldn't further process the packet
+        payload.set_verdict(nfqueue.NF_DROP)
+
+        if mac != binding.mac:
+            logging.warn(" - RS: Received spoofed request from %s (and not %s)",
+                         mac, binding)
+            return
+
+        subnet = binding.net6
+
+        if subnet.net is None:
+            logging.debug(" - RS: No IPv6 network assigned to %s", binding)
+            return
+
+        indevmac = self.get_iface_hw_addr(binding.indev)
+        ifll = subnet.make_ll64(indevmac)
+        if ifll is None:
+            return
 
         resp = Ether(src=indevmac)/\
-               IPv6(src=str(ifll))/ICMPv6ND_RA(routerlifetime=14400)/\
+               IPv6(src=str(ifll))/ICMPv6ND_RA(O=1, routerlifetime=14400)/\
                ICMPv6NDOptPrefixInfo(prefix=str(subnet.prefix),
                                      prefixlen=subnet.prefixlen)
 
@@ -746,54 +832,60 @@ class VMNetProxy(object):  # pylint: disable=R0902
             resp /= ICMPv6NDOptRDNSS(dns=self.ipv6_nameservers,
                                      lifetime=self.ra_period * 3)
 
-        try:
-            self.sendp(resp, binding)
-        except socket.error, e:
-            logging.warn(" - RA on %s (%s) failed: %s",
-                         binding.tap, binding.hostname, str(e))
-        except Exception, e:
-            logging.warn(" - Unkown error during RA on %s (%s): %s",
-                         binding.tap, binding.hostname, str(e))
+        logging.info(" - RESPONSE: RA for %s", binding)
 
-    def ns_response(self, dummy, payload):  # pylint: disable=W0613
+        try:
+            binding.sendp(resp)
+        except socket.error, e:
+            logging.warn(" - RS: RA failed on %s: %s",
+                         binding, str(e))
+        except Exception, e:
+            logging.warn(" - RS: Unkown error during RA on %s: %s",
+                         binding, str(e))
+
+    def ns_response(self, arg1, arg2=None):  # pylint: disable=W0613
         """ Generate a reply to an ICMPv6 neighbor solicitation
 
         """
 
-        logging.info(" * Processing pending NS request")
+        logging.info(" * NS: Processing pending request")
+        # Workaround for supporting both squeezy's nfqueue-bindings-python
+        # and wheezy's python-nfqueue because for some reason the function's
+        # signature has changed and has broken compatibility
+        # See bug http://bugs.debian.org/cgi-bin/bugreport.cgi?bug=718894
+        if arg2:
+            payload = arg2
+        else:
+            payload = arg1
 
         ns = IPv6(payload.get_data())
         #logging.debug(ns.show())
         try:
             mac = ns.lladdr
         except:
-            logging.debug(" - Cannot obtain lladdr from ns")
+            logging.debug(" - NS: Cannot obtain lladdr")
             return
 
 
         indev = get_indev(payload)
 
-        binding = get_binding(self, indev, mac)
+        binding = self.get_binding(indev, mac)
         if binding is None:
             # We don't know anything about this interface, so accept the packet
-            # and return
-            logging.debug(" - Ignoring neighbour solicitation for eui64 %s",
-                          ns.tgt)
-            # We don't know what to do with this packet, so let the kernel
-            # handle it
+            # and return and let the kernel handle it
             payload.set_verdict(nfqueue.NF_ACCEPT)
             return
 
         payload.set_verdict(nfqueue.NF_DROP)
 
         if mac != binding.mac:
-            logging.warn(" - Received spoofed NS request"
-                         " for mac %s from tap %s", mac, binding.tap)
+            logging.warn(" - NS: Received spoofed request from %s (and not %s)",
+                         mac, binding)
             return
 
         subnet = binding.net6
         if subnet.net is None:
-            logging.debug(" - No IPv6 network assigned for the interface")
+            logging.debug(" - NS: No IPv6 network assigned to %s", binding)
             return
 
         indevmac = self.get_iface_hw_addr(binding.indev)
@@ -803,25 +895,24 @@ class VMNetProxy(object):  # pylint: disable=R0902
             return
 
         if not (subnet.net.overlaps(ns.tgt) or str(ns.tgt) == str(ifll)):
-            logging.debug(" - Received NS for a non-routable IP (%s)", ns.tgt)
+            logging.debug(" - NS: Received NS for a non-routable IP (%s)", ns.tgt)
             return 1
-
-        logging.info(" - Generating NA for host %s (mac %s) on tap %s",
-                     binding.hostname, mac, binding.tap)
 
         resp = Ether(src=indevmac, dst=binding.mac)/\
                IPv6(src=str(ifll), dst=ns.src)/\
                ICMPv6ND_NA(R=1, O=0, S=1, tgt=ns.tgt)/\
                ICMPv6NDOptDstLLAddr(lladdr=indevmac)
 
+        logging.info(" - RESPONSE: NA for %s ", binding)
+
         try:
-            self.sendp(resp, binding)
+            binding.sendp(resp)
         except socket.error, e:
-            logging.warn(" - NA on %s (%s) failed: %s",
-                         bindig.tap, binding.hostname, str(e))
+            logging.warn(" - NS: NA on %s failed: %s",
+                         binding, str(e))
         except Exception, e:
-            logging.warn(" - Unkown error during periodic NA to %s (%s): %s",
-                         binding.tap, binding.hostname, str(e))
+            logging.warn(" - NS: Unkown error during NA to %s: %s",
+                         binding, str(e))
 
     def send_periodic_ra(self):
         # Use a separate thread as this may take a _long_ time with
@@ -829,7 +920,7 @@ class VMNetProxy(object):  # pylint: disable=R0902
         threading.Thread(target=self._send_periodic_ra).start()
 
     def _send_periodic_ra(self):
-        logging.info("Sending out periodic RAs")
+        logging.info(" * Periodic RA: Starting...")
         start = time.time()
         i = 0
         for binding in self.clients.values():
@@ -838,30 +929,30 @@ class VMNetProxy(object):  # pylint: disable=R0902
             # mac = binding.mac
             subnet = binding.net6
             if subnet.net is None:
-                logging.debug(" - Skipping periodic RA on interface %s,"
-                              " as it is not IPv6-connected", tap)
+                logging.debug(" - Periodic RA: Skipping %s", binding)
                 continue
             indevmac = self.get_iface_hw_addr(indev)
             ifll = subnet.make_ll64(indevmac)
             if ifll is None:
                 continue
             resp = Ether(src=indevmac)/\
-                   IPv6(src=str(ifll))/ICMPv6ND_RA(routerlifetime=14400)/\
+                   IPv6(src=str(ifll))/ICMPv6ND_RA(O=1, routerlifetime=14400)/\
                    ICMPv6NDOptPrefixInfo(prefix=str(subnet.prefix),
                                          prefixlen=subnet.prefixlen)
             if self.ipv6_nameservers:
                 resp /= ICMPv6NDOptRDNSS(dns=self.ipv6_nameservers,
                                          lifetime=self.ra_period * 3)
+            logging.info(" - RESPONSE: NA for %s ", binding)
             try:
-                self.sendp(resp, binding)
+                binding.sendp(resp)
             except socket.error, e:
-                logging.warn(" - Periodic RA on %s (%s) failed: %s",
-                             tap, binding.hostname, str(e))
+                logging.warn(" - Periodic RA: Failed on %s: %s",
+                             binding, str(e))
             except Exception, e:
-                logging.warn(" - Unkown error during periodic RA on %s (%s):"
-                             " %s", tap, binding.hostname, str(e))
+                logging.warn(" - Periodic RA: Unkown error on %s: %s",
+                             binding, str(e))
             i += 1
-        logging.info(" - Sent %d RAs in %.2f seconds", i, time.time() - start)
+        logging.info(" - Periodic RA: Sent %d RAs in %.2f seconds", i, time.time() - start)
 
     def serve(self):
         """ Safely perform the main loop, freeing all resources upon exit
@@ -891,7 +982,8 @@ class VMNetProxy(object):  # pylint: disable=R0902
 
         while True:
             try:
-                rlist, _, xlist = select.select(self.nfq.keys() + [iwfd], [], [], timeout)
+                rlist, _, xlist = select.select(self.nfq.keys() + [iwfd],
+                                                [], [], timeout)
             except select.error, e:
                 if e[0] == errno.EINTR:
                     logging.debug("select() got interrupted")
@@ -933,9 +1025,11 @@ class VMNetProxy(object):  # pylint: disable=R0902
                     timeout = self.ra_period - (time.time() - start)
 
     def print_clients(self):
-        logging.info("%10s   %20s %20s %10s %20s",'Key', 'Client', 'MAC', 'TAP', 'IP')
+        logging.info("%10s   %20s %20s %10s %20s %40s",
+                     'Key', 'Client', 'MAC', 'TAP', 'IP', 'IPv6')
         for k, cl in self.clients.items():
-            logging.info("%10s | %20s %20s %10s %20s", k, cl.hostname, cl.mac, cl.tap, cl.ip)
+            logging.info("%10s | %20s %20s %10s %20s %40s",
+                         k, cl.hostname, cl.mac, cl.tap, cl.ip, cl.eui64)
 
 
 
@@ -1025,7 +1119,8 @@ if __name__ == "__main__":
                        capng.CAP_SETPCAP)
     # change uid
     capng.capng_change_id(uid.pw_uid, uid.pw_gid,
-                          capng.CAPNG_DROP_SUPP_GRP | capng.CAPNG_CLEAR_BOUNDING)
+                          capng.CAPNG_DROP_SUPP_GRP | \
+                          capng.CAPNG_CLEAR_BOUNDING)
 
     logger = logging.getLogger()
     if opts.debug:
@@ -1087,10 +1182,12 @@ if __name__ == "__main__":
 
     if config["ipv6"].as_bool("enable_ipv6"):
         proxy_opts.update({
+            "dhcpv6_queue_num": config["ipv6"].as_int("dhcp_queue"),
             "rs_queue_num": config["ipv6"].as_int("rs_queue"),
             "ns_queue_num": config["ipv6"].as_int("ns_queue"),
             "ra_period": config["ipv6"].as_int("ra_period"),
             "ipv6_nameservers": config["ipv6"]["nameservers"],
+            "dhcpv6_domains": config["ipv6"]["domains"],
         })
 
     # pylint: disable=W0142
@@ -1099,12 +1196,12 @@ if __name__ == "__main__":
     logging.info("Ready to serve requests")
 
 
-    def handler(signum, frame):
-        logging.debug('Received SIGUSR1. Printing current proxy state...')
+    def debug_handler(signum, _):
+        logging.debug('Received signal %d. Printing proxy state...', signum)
         proxy.print_clients()
 
     # Set the signal handler for debuging clients
-    signal.signal(signal.SIGUSR1, handler)
+    signal.signal(signal.SIGUSR1, debug_handler)
     signal.siginterrupt(signal.SIGUSR1, False)
 
     try:
