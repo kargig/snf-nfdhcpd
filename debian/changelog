@@ -1,3 +1,9 @@
+nfdhcpd (0.12.3-2~jessie) jessie; urgency=medium
+
+  * Rebuild for jessie
+
+ -- Filippos Giannakos <philipgian@grnet.gr>  Mon, 04 Jul 2016 10:41:06 +0300
+
 nfdhcpd (0.12.3-1~wheezy) wheezy; urgency=low
 
   * Some changes in logging format
@@ -106,6 +112,7 @@ nfdhcpd (0.1) unstable; urgency=low
   * Initial Release.
 
  -- Apollon Oikonomopoulos <apollon@noc.grnet.gr>  Mon, 15 Nov 2010 12:42:53 +0200
+
 
 
 
